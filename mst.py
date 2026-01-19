@@ -1,8 +1,7 @@
-import os
+import json
 import re
 import time
-import unicodedata
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 import pandas as pd
 import requests
@@ -10,45 +9,45 @@ from tqdm import tqdm
 
 
 API_TEMPLATE = "https://api.vietqr.io/v2/business/{mst}"
-MASOTHUE_TEMPLATE = "https://masothue.com/{id}-{slug}"
 
 
-def slugify_vi(text: str) -> str:
+def normalize_mst(value: str) -> Optional[str]:
     """
-    Chuyển tên DN tiếng Việt -> slug kiểu masothue.com:
-    - bỏ dấu
-    - lowercase
-    - ký tự không phải a-z0-9 -> '-'
-    - gộp nhiều '-' liên tiếp
-    """
-    if text is None:
-        return ""
-    text = text.strip().lower()
-
-    # bỏ dấu unicode
-    text = unicodedata.normalize("NFD", text)
-    text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
-    # đ/Đ
-    text = text.replace("đ", "d")
-
-    # thay ký tự không hợp lệ bằng '-'
-    text = re.sub(r"[^a-z0-9]+", "-", text)
-    text = re.sub(r"-{2,}", "-", text).strip("-")
-    return text
-
-
-def normalize_mst(value) -> Optional[str]:
-    """
-    Chuẩn hoá MST:
-    - giữ số và dấu '-' (một số MST có hậu tố dạng 0101234567-001)
+    Chuẩn hoá MST để gọi API:
+    - giữ số và dấu '-' (ví dụ: 0101234567-001)
     - bỏ khoảng trắng
+    - loại ký tự lạ
     """
-    if pd.isna(value):
+    if value is None:
         return None
     s = str(value).strip()
+    if not s:
+        return None
     s = re.sub(r"\s+", "", s)
     s = re.sub(r"[^0-9\-]", "", s)
     return s if s else None
+
+
+def read_mst_txt(path: str) -> List[str]:
+    """
+    Đọc txt_mst.txt dạng:
+    MST_CLEAN
+    8703744430-001
+    0110985790
+    ...
+    """
+    msts: List[str] = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            if line.upper() == "MST_CLEAN":
+                continue
+            mst = normalize_mst(line)
+            if mst:
+                msts.append(mst)
+    return msts
 
 
 def call_vietqr(mst: str, session: requests.Session, timeout: int = 20) -> Dict[str, Any]:
@@ -58,108 +57,86 @@ def call_vietqr(mst: str, session: requests.Session, timeout: int = 20) -> Dict[
     return r.json()
 
 
-def save_html(url: str, out_path: str, session: requests.Session, timeout: int = 30) -> int:
+def flatten_json(js: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Tải và lưu HTML. Trả về status_code.
+    Trả về dict phẳng để ghi CSV.
+    Giữ:
+    - code, desc
+    - data.* (nếu có)
+    - raw_json (để debug)
     """
-    r = session.get(url, timeout=timeout)
-    status = r.status_code
+    out: Dict[str, Any] = {}
+    out["code"] = js.get("code", "")
+    out["desc"] = js.get("desc", "")
 
-    # Lưu cả khi không phải 200 để debug (tuỳ bạn). Ở đây chỉ lưu khi 200:
-    if status == 200:
-        # masothue.com trả HTML utf-8, dùng bytes để giữ nguyên
-        with open(out_path, "wb") as f:
-            f.write(r.content)
-    return status
+    data = js.get("data") or {}
+    if isinstance(data, dict):
+        for k, v in data.items():
+            out[f"data_{k}"] = v
+    else:
+        out["data"] = data
+
+    out["raw_json"] = json.dumps(js, ensure_ascii=False)
+    return out
 
 
 def main(
-    excel_path: str = "test.xlsx",
-    out_dir: str = "html_masothue",
-    out_csv: str = "output.csv",
-    sleep_seconds: float = 0.5,
+    txt_path: str = "txt_mst.txt",
+    out_csv: str = "vietqr_output.csv",
+    sleep_seconds: float = 0.2,
 ):
-    if not os.path.exists(excel_path):
-        raise FileNotFoundError(f"Không thấy file: {excel_path}")
+    msts = read_mst_txt(txt_path)
+    if not msts:
+        raise ValueError(f"Không đọc được MST nào từ file: {txt_path}")
 
-    os.makedirs(out_dir, exist_ok=True)
-
-    df = pd.read_excel(excel_path, dtype=str)  # đọc tất cả dạng str để không mất số 0 đầu
-    # Bạn có thể đổi tên cột ở đây nếu file thực tế khác
-    mst_col = "Mã số thuế"
-    if mst_col not in df.columns:
-        raise ValueError(f"Không thấy cột '{mst_col}' trong Excel. Các cột hiện có: {list(df.columns)}")
-
-    df["mst_norm"] = df[mst_col].apply(normalize_mst)
-
-    # Chuẩn bị kết quả
-    df["api_code"] = ""
-    df["api_desc"] = ""
-    df["business_id"] = ""
-    df["business_name"] = ""
-    df["masothue_url"] = ""
-    df["html_status"] = ""
-    df["html_file"] = ""
+    total = len(msts)
+    ok = 0
+    fail = 0
+    rows: List[Dict[str, Any]] = []
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; Python script for business lookup; +https://example.com)",
-        "Accept": "application/json,text/html;q=0.9,*/*;q=0.8",
+        "User-Agent": "Mozilla/5.0 (compatible; Python script for business lookup)",
+        "Accept": "application/json,*/*;q=0.8",
     }
 
     with requests.Session() as session:
         session.headers.update(headers)
 
-        for idx in tqdm(df.index, desc="Processing"):
-            mst = df.at[idx, "mst_norm"]
-            if not mst:
-                df.at[idx, "api_desc"] = "Missing MST"
-                continue
+        pbar = tqdm(total=total, desc="Calling VietQR", unit="mst")
+        for i, mst in enumerate(msts, 1):
+            row: Dict[str, Any] = {"mst_input": mst}
 
-            # 1) Call API VietQR
             try:
                 js = call_vietqr(mst, session=session)
+                row.update(flatten_json(js))
+                ok += 1
             except Exception as e:
-                df.at[idx, "api_desc"] = f"API error: {e}"
-                continue
+                row["code"] = ""
+                row["desc"] = f"ERROR: {e}"
+                row["raw_json"] = ""
+                fail += 1
 
-            df.at[idx, "api_code"] = js.get("code", "")
-            df.at[idx, "api_desc"] = js.get("desc", "")
+            rows.append(row)
 
-            data = js.get("data") or {}
-            business_id = data.get("id") or ""
-            business_name = data.get("name") or ""
+            # cập nhật tiến trình + thống kê
+            pbar.set_postfix_str(f"done={i}/{total} | ok={ok} | fail={fail}")
+            pbar.update(1)
 
-            df.at[idx, "business_id"] = business_id
-            df.at[idx, "business_name"] = business_name
-
-            if not business_id or not business_name:
-                # Có thể API trả code khác "00" hoặc data rỗng
-                continue
-
-            # 2) Tạo URL masothue.com
-            slug = slugify_vi(business_name)
-            masothue_url = MASOTHUE_TEMPLATE.format(id=business_id, slug=slug)
-            df.at[idx, "masothue_url"] = masothue_url
-
-            # 3) Tải HTML và lưu file
-            safe_id = re.sub(r"[^0-9\-]", "_", business_id)
-            out_path = os.path.join(out_dir, f"{safe_id}.html")
-
-            try:
-                status = save_html(masothue_url, out_path, session=session)
-                df.at[idx, "html_status"] = str(status)
-                if status == 200:
-                    df.at[idx, "html_file"] = out_path
-            except Exception as e:
-                df.at[idx, "html_status"] = f"HTML error: {e}"
-
-            # nghỉ một chút để hạn chế bị chặn
             time.sleep(sleep_seconds)
 
-    # Lưu file kết quả
-    df.to_csv(out_csv, index=False)
-    print(f"Done. HTML saved in: {out_dir}")
-    print(f"Result Excel: {out_csv}")
+        pbar.close()
+
+    df = pd.DataFrame(rows)
+
+    # Sắp xếp cột cho dễ nhìn: mst_input, code, desc trước
+    first_cols = [c for c in ["mst_input", "code", "desc"] if c in df.columns]
+    other_cols = [c for c in df.columns if c not in first_cols]
+    df = df[first_cols + other_cols]
+
+    df.to_csv(out_csv, index=False, encoding="utf-8-sig")
+
+    print(f"Done. Total={total} | OK={ok} | FAIL={fail}")
+    print(f"Output CSV: {out_csv}")
 
 
 if __name__ == "__main__":
